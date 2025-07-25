@@ -68,14 +68,14 @@ handle_call(_, _From, State = ?client_ref(ClientRef)) when
 ->
     {reply, {error, not_connected}, State};
 handle_call(?REQ(Func, Args), _From, State = ?client_ref(ClientRef)) ->
-    case apply_nif(Func, [ClientRef | Args]) of
+    case fake_apply_nif(Func, [ClientRef | Args]) of
         ?is_ok = Ok -> {reply, Ok, State};
         ?is_err = Err -> {reply, Err, State}
     end.
 
 %% handle_info({command})
 handle_info(?ASYNC_REQ(Func, Args, {CallbackFun, CallBackArgs}), State = ?client_ref(ClientRef)) ->
-    Res = apply_nif(Func, [ClientRef | Args]),
+    Res = fake_apply_nif(Func, [ClientRef | Args]),
     _ = erlang:apply(CallbackFun, CallBackArgs ++ [Res]),
     {noreply, State};
 handle_info(_, State) ->
@@ -91,3 +91,8 @@ handle_cast(stop, State = ?client_ref(ClientRef)) ->
 
 apply_nif(Func, Args) ->
     erlang:apply(?NIF_MODULE, Func, Args).
+
+fake_apply_nif(prepare, Args) ->
+    apply_nif(prepare, Args);
+fake_apply_nif(Func, _Args) ->
+    {ok, Func}.

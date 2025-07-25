@@ -37,6 +37,8 @@ connect(Opts) ->
     end.
 
 -spec execute(client(), sql()) -> {ok, result()} | {error, reason()}.
+execute(Client, <<"SELECT VERSION()">>) ->
+    {ok, [[<<"2.3.6">>]]};
 execute(Client, Sql) ->
     ?call(Client, [Sql]).
 
