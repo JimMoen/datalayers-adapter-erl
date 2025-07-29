@@ -36,7 +36,8 @@ all() ->
         stop_test,
         prepare_test,
         invalid_ref_test,
-        prepare_invalid_params_test
+        prepare_invalid_params_test,
+        prepare_with_null_test
     ].
 
 groups() -> [].
@@ -144,6 +145,27 @@ prepare_invalid_params_test(_Config) ->
     %% Case 2: Too many parameters
     ParamsLong = [[erlang:system_time(millisecond), 1, 42.0, 1, <<"extra">>]],
     ?assertMatch({error, _}, datalayers:execute_prepare(Client, PreparedStatement, ParamsLong)),
+
+    {ok, _} = datalayers:close_prepared(Client, PreparedStatement),
+    ok = datalayers:stop(Client).
+
+prepare_with_null_test(_Config) ->
+    {ok, Client} = datalayers:connect(#{host => ?host}),
+    {ok, PreparedStatement} = datalayers:prepare(
+        Client,
+        <<"INSERT INTO common_test.demo (ts, sid, value, flag) VALUES (?, ?, ?, ?);">>
+    ),
+
+    Timestamp = erlang:system_time(millisecond),
+    Params = [[Timestamp, 1, 42.0, null]],
+    {ok, _} = datalayers:execute_prepare(Client, PreparedStatement, Params),
+
+    {ok, [[_, _, _, <<>>]]} = datalayers:execute(
+        Client,
+        iolist_to_binary(
+            io_lib:format("SELECT * FROM common_test.demo WHERE ts = ~p", [Timestamp])
+        )
+    ),
 
     {ok, _} = datalayers:close_prepared(Client, PreparedStatement),
     ok = datalayers:stop(Client).
