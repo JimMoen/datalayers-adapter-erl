@@ -28,6 +28,7 @@
 
 -define(drop_table, <<"DROP TABLE IF EXISTS common_test.demo">>).
 
+%% erlfmt-ignore
 -define(create_nullable_table, <<"
     CREATE TABLE common_test.demo_nullable (
         ts TIMESTAMP NOT NULL,
