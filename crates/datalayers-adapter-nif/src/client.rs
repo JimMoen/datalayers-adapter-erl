@@ -110,9 +110,6 @@ impl Client {
         use futures::TryStreamExt;
         let stream = self.inner.do_get(ticket).await?;
         let batches = stream.try_collect::<Vec<_>>().await?;
-        if batches.is_empty() {
-            bail!("Unexpected empty batches");
-        }
         Ok(batches)
     }
 }
