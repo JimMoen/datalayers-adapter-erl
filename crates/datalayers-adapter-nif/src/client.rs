@@ -13,9 +13,10 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 /// Run `fut`, bounded by `limit`, tagging any error with the flight stage it came
 /// from.
 ///
-/// Without a bound, a half-open TCP connection makes `RT.block_on(...)` hang
-/// forever: the calling thread is blocked, the Erlang async callback never fires
-/// and the buffer worker's inflight window is never reclaimed.
+/// Without a bound, a half-open TCP connection makes the future never complete:
+/// the task would occupy a shared runtime worker forever, the socket would never
+/// receive a completion and the buffer worker's inflight window would never be
+/// reclaimed.
 ///
 /// The limit is always supplied by the caller (`Client` carries the value it was
 /// created with) — there is deliberately no hidden global or environment knob.
@@ -154,12 +155,6 @@ impl Client {
             .context("Failed to close a prepared statement")
     }
 
-    pub async fn stop(self) {
-        // By taking ownership of self, this method consumes the Client.
-        // When the method returns, self is dropped, and the underlying
-        // gRPC channel is closed.
-    }
-
     async fn do_get(&mut self, ticket: Ticket) -> Result<Vec<RecordBatch>> {
         use futures::TryStreamExt;
         let stream = self.inner.do_get(ticket).await?;
@@ -170,7 +165,8 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::timed;
+    use super::{Client, timed};
+    use crate::client_opts::ClientOpts;
     use std::time::Duration;
 
     #[tokio::test]
@@ -228,5 +224,44 @@ mod tests {
         // chain, which is why the NIF entry points encode errors with `{:#}`.
         assert_eq!(err.to_string(), "[execute_prepared:do_get]");
         assert!(format!("{err:#}").contains("gone"), "{err:#}");
+    }
+
+    /// A peer that accepts TCP but never speaks HTTP/2 is the exact half-open
+    /// symptom seen in the field. Establishing the connection must fail within
+    /// the per-stage timeout rather than hanging forever.
+    #[tokio::test]
+    async fn connecting_to_a_silent_server_is_bounded_by_the_stage_timeout() {
+        use std::time::Instant;
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local TCP listener");
+        let port = listener.local_addr().expect("listener address").port();
+        // Accept connections and hold them open without ever writing a byte.
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept() {
+                held.push(stream);
+            }
+        });
+
+        let opts = ClientOpts {
+            host: Some("127.0.0.1".to_string()),
+            port: Some(port),
+            timeout_ms: Some(300),
+            ..Default::default()
+        };
+
+        let started = Instant::now();
+        let err = match Client::try_new(&opts).await {
+            Ok(_) => panic!("connecting to a silent server must fail, not hang"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            format!("{err:#}").contains("timed out after"),
+            "expected a bounded timeout, got: {err:#}"
+        );
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?} to fail");
     }
 }
