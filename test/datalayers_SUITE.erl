@@ -66,7 +66,14 @@ groups() ->
         t_async_ordering,
         t_async_error_reply,
         t_async_prepare_auto_rebuild,
-        t_sync_after_async_ordering
+        t_sync_after_async_ordering,
+        t_async_nif_replies_to_given_pid,
+        t_runs_without_the_new_options,
+        t_connect_timeout_is_bounded,
+        t_request_deadline_is_honored,
+        t_socket_never_runs_a_blocking_nif,
+        t_stop_releases_a_pending_sync_caller,
+        t_second_connect_while_connecting_is_rejected
     ],
     [
         {tcp, TCs},
@@ -176,31 +183,38 @@ t_prepare_test(Config) ->
     ok = datalayers:stop(Client).
 
 t_invalid_ref_test(Config) ->
-    {ok, ClientRef} = datalayers_nif:connect(?conn_opts(Config)),
+    ClientRef = connect_client_ref(Config),
     InvalidRef = make_ref(),
 
+    %% Stale resource references are rejected synchronously, before any work is
+    %% submitted: the async NIFs answer with {error, Reason} instead of `ok`.
     ?assertMatch(
-        {error, <<"invalid_client_resource">>}, datalayers_nif:execute(InvalidRef, <<"SELECT 1">>)
+        {error, <<"invalid_client_resource">>},
+        datalayers_nif:async_execute(self(), 1, InvalidRef, <<"SELECT 1">>)
     ),
     ?assertMatch(
         {error, <<"invalid_client_resource">>},
-        datalayers_nif:prepare(InvalidRef, <<"SELECT 1">>, false)
+        datalayers_nif:async_use_database(self(), 2, InvalidRef, <<"some_db">>)
     ),
     ?assertMatch(
         {error, <<"invalid_client_resource">>},
-        datalayers_nif:execute_prepare(InvalidRef, InvalidRef, [])
+        datalayers_nif:async_prepare(self(), 3, InvalidRef, <<"SELECT 1">>, false)
+    ),
+    ?assertMatch(
+        {error, <<"invalid_client_resource">>},
+        datalayers_nif:async_execute_prepare(self(), 4, InvalidRef, InvalidRef, [])
     ),
     ?assertMatch(
         {error, <<"invalid_statement_resource">>},
-        datalayers_nif:execute_prepare(ClientRef, InvalidRef, [])
+        datalayers_nif:async_execute_prepare(self(), 5, ClientRef, InvalidRef, [])
     ),
     ?assertMatch(
         {error, <<"invalid_client_resource">>},
-        datalayers_nif:close_prepared(InvalidRef, InvalidRef)
+        datalayers_nif:async_close_prepared(self(), 6, InvalidRef, InvalidRef)
     ),
     ?assertMatch(
         {error, <<"invalid_statement_resource">>},
-        datalayers_nif:close_prepared(ClientRef, InvalidRef)
+        datalayers_nif:async_close_prepared(self(), 7, ClientRef, InvalidRef)
     ),
 
     ok = datalayers_nif:stop(ClientRef).
@@ -431,6 +445,111 @@ t_sync_after_async_ordering(Config) ->
     ?assertEqual([{ok, [[N]]} || N <- Sqls], Results),
     ok = datalayers:stop(Client).
 
+%% The async NIFs deliver their result to the pid they were handed, as
+%% {datalayers_async_result, Id, Result}, independently of the socket process.
+t_async_nif_replies_to_given_pid(Config) ->
+    ClientRef = connect_client_ref(Config),
+    Id = erlang:unique_integer([monotonic, positive]),
+    ok = datalayers_nif:async_execute(self(), Id, ClientRef, <<"SELECT version()">>),
+    {ok, [[Vsn]]} = receive_async_result_by_id(Id, 5000),
+    ?assertEqual(?version(Config), Vsn),
+    ok = datalayers_nif:stop(ClientRef).
+
+%% The upper layer (EMQX) does not have to pass `request_timeout` or
+%% `max_in_flight`: the NIF must fall back to its own defaults, and those
+%% defaults must let a normal multi-stage request through.
+t_runs_without_the_new_options(Config) ->
+    ConnOpts = ?conn_opts(Config),
+    ?assertEqual(false, maps:is_key(request_timeout, ConnOpts)),
+    ?assertEqual(false, maps:is_key(max_in_flight, ConnOpts)),
+    {ok, Client} = datalayers:connect(ConnOpts),
+    {ok, [[Vsn]]} = do_execute(Client, <<"SELECT version()">>),
+    ?assertEqual(?version(Config), Vsn),
+    {ok, PreparedStatement} = datalayers:prepare(Client, ?insert_prepare_sql_statement(Config)),
+    Timestamp = erlang:system_time(millisecond),
+    {ok, _} = datalayers:execute_prepare(Client, PreparedStatement, [[Timestamp, 1, 42.0, 1]]),
+    ?assertMatch(
+        {ok, [[_, <<"1">>, <<"42.0">>, <<"1">>]]},
+        do_execute(Client, ?select_all_from_table_by_ts(Config, Timestamp))
+    ),
+    {ok, _} = datalayers:close_prepared(Client, PreparedStatement),
+    ok = datalayers:stop(Client).
+
+%% A peer that accepts TCP but never answers must fail the connect within the
+%% per-stage timeout instead of hanging the caller forever.
+t_connect_timeout_is_bounded(_Config) ->
+    {Server, Port} = silent_server(),
+    Opts = silent_conn_opts(Port, 500),
+    {Micros, Result} = timer:tc(fun() -> datalayers:connect(Opts) end),
+    exit(Server, kill),
+    {error, Reason} = Result,
+    ?assertNotEqual(nomatch, binary:match(Reason, <<"timed out after">>)),
+    ?assert(Micros < 5_000_000).
+
+%% The whole-request deadline must fire before the per-stage timeout when it is
+%% the smaller of the two, so a request can not span several stages' worth of time.
+t_request_deadline_is_honored(_Config) ->
+    {Server, Port} = silent_server(),
+    Opts = silent_conn_opts(Port, 5000, 200),
+    {Micros, Result} = timer:tc(fun() -> datalayers:connect(Opts) end),
+    exit(Server, kill),
+    {error, Reason} = Result,
+    ?assertNotEqual(nomatch, binary:match(Reason, <<"[request] timed out after">>)),
+    ?assert(Micros < 2_000_000).
+
+%% Regression guard for emqx/emqx#19342: while a hung connect is in flight, the
+%% socket process must never be inside a datalayers_nif function. Blocking in a
+%% NIF would pin a BEAM scheduler thread (a DirtyIo one in the old code) and
+%% starve unrelated file/log I/O across the whole VM.
+t_socket_never_runs_a_blocking_nif(_Config) ->
+    {Server, Port} = silent_server(),
+    Opts = silent_conn_opts(Port, 2000),
+    {ok, Sock} = datalayers_sock:start(),
+    Self = self(),
+    _Caller = spawn(fun() ->
+        Self ! {connect_result, datalayers_sock:sync_command(Sock, connect, [Opts])}
+    end),
+    ok = assert_never_inside_nif(Sock, 30, 50),
+    {error, Reason} = receive_tagged(connect_result, 6000),
+    exit(Server, kill),
+    ?assertNotEqual(nomatch, binary:match(Reason, <<"timed out after">>)),
+    _ = catch datalayers_sock:stop(Sock),
+    ok.
+
+%% Stopping a socket must release a caller that is still waiting for a reply
+%% instead of leaving it blocked on gen_server:call/3 forever.
+t_stop_releases_a_pending_sync_caller(_Config) ->
+    {Server, Port} = silent_server(),
+    Opts = silent_conn_opts(Port, 5000),
+    {ok, Sock} = datalayers_sock:start(),
+    Self = self(),
+    _Caller = spawn(fun() ->
+        Self ! {connect_result, datalayers_sock:sync_command(Sock, connect, [Opts])}
+    end),
+    ct:sleep(100),
+    ok = datalayers_sock:stop(Sock),
+    ?assertEqual({error, stopped}, receive_tagged(connect_result, 2000)),
+    exit(Server, kill),
+    ok.
+
+%% A second connect must be rejected while the first is still queued or in flight;
+%% otherwise the socket would end up with two clients and silently drop the first
+%% connection's channel.
+t_second_connect_while_connecting_is_rejected(_Config) ->
+    {Server, Port} = silent_server(),
+    Opts = silent_conn_opts(Port, 3000),
+    {ok, Sock} = datalayers_sock:start(),
+    Self = self(),
+    _Caller = spawn(fun() ->
+        Self ! {connect_result, datalayers_sock:sync_command(Sock, connect, [Opts])}
+    end),
+    ct:sleep(100),
+    ?assertEqual({error, already_connected}, datalayers_sock:sync_command(Sock, connect, [Opts])),
+    {error, _} = receive_tagged(connect_result, 6000),
+    exit(Server, kill),
+    _ = catch datalayers_sock:stop(Sock),
+    ok.
+
 %% ================================================================================
 %% Helpers
 %% ================================================================================
@@ -477,3 +596,89 @@ receive_async_result(Timeout) ->
     after Timeout ->
         ct:fail("timed out waiting for async result")
     end.
+
+%% Connect straight through the NIF surface and return the client resource ref,
+%% so tests can drive the async NIF entry points without a socket process.
+connect_client_ref(Config) ->
+    Id = erlang:unique_integer([monotonic, positive]),
+    ok = datalayers_nif:async_connect(self(), Id, ?conn_opts(Config)),
+    receive
+        {datalayers_async_result, Id, {ok, Ref}} when is_reference(Ref) ->
+            Ref;
+        {datalayers_async_result, Id, {error, Reason}} ->
+            ct:fail("async_connect failed: ~p", [Reason])
+    after 10000 ->
+        ct:fail("async_connect did not reply")
+    end.
+
+receive_async_result_by_id(Id, Timeout) ->
+    receive
+        {datalayers_async_result, Id, Result} -> Result
+    after Timeout ->
+        ct:fail("timed out waiting for async result ~p", [Id])
+    end.
+
+receive_tagged(Tag, Timeout) ->
+    receive
+        {Tag, Value} -> Value
+    after Timeout ->
+        ct:fail("timed out waiting for ~p", [Tag])
+    end.
+
+%% Options for a plain TCP connection to a local silent server. Deliberately built
+%% from scratch so the TLS group does not leak a tls_cert into this test.
+silent_conn_opts(Port, Timeout) ->
+    silent_conn_opts(Port, Timeout, undefined).
+
+silent_conn_opts(Port, Timeout, undefined) ->
+    #{
+        host => <<"127.0.0.1">>,
+        port => Port,
+        username => <<"admin">>,
+        password => <<"public">>,
+        timeout => Timeout
+    };
+silent_conn_opts(Port, Timeout, RequestTimeout) ->
+    (silent_conn_opts(Port, Timeout, undefined))#{request_timeout => RequestTimeout}.
+
+%% A TCP server that accepts connections and never writes a byte: the half-open
+%% peer that makes a blocking client hang.
+silent_server() ->
+    Parent = self(),
+    Server =
+        spawn(fun() ->
+            {ok, Listen} = gen_tcp:listen(0, [
+                binary, {active, false}, {reuseaddr, true}, {ip, {127, 0, 0, 1}}
+            ]),
+            {ok, Port} = inet:port(Listen),
+            Parent ! {silent_server, self(), Port},
+            hold_connections(Listen, [])
+        end),
+    receive
+        {silent_server, Server, Port} -> {Server, Port}
+    after 5000 ->
+        ct:fail("silent server did not start")
+    end.
+
+hold_connections(Listen, Held) ->
+    case gen_tcp:accept(Listen, 5000) of
+        {ok, Socket} ->
+            %% Keep the socket open and never write: a silent peer.
+            hold_connections(Listen, [Socket | Held]);
+        {error, timeout} ->
+            hold_connections(Listen, Held);
+        {error, _} ->
+            ok
+    end.
+
+assert_never_inside_nif(_Sock, 0, _SleepMs) ->
+    ok;
+assert_never_inside_nif(Sock, N, SleepMs) ->
+    case process_info(Sock, current_function) of
+        {current_function, {datalayers_nif, Func, Arity}} ->
+            ct:fail("socket process was blocked inside datalayers_nif:~p/~p", [Func, Arity]);
+        _ ->
+            ok
+    end,
+    ct:sleep(SleepMs),
+    assert_never_inside_nif(Sock, N - 1, SleepMs).
