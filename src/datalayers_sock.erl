@@ -7,24 +7,19 @@
 -record(state, {
     client :: client_ref() | undefined,
     opts :: opts() | undefined,
-    %% id of the async request currently in flight (single in-flight per
-    %% connection, so per-connection ordering is preserved)
+    %% id of the request currently in flight. There is at most one per connection,
+    %% which is what preserves the order of the synchronous and asynchronous
+    %% requests that share this socket.
     current = undefined :: integer() | undefined,
-    %% id => callback, for queued and in-flight async requests
-    pending = #{} :: #{integer() => callback()},
-    %% requests waiting to be dispatched: {async, Id, Func, Args} runs on the NIF
-    %% worker, {sync, From, Func, Args} runs in this process.  Both kinds share the
-    %% queue so that one socket preserves the order of sync and async requests.
-    queue = queue:new() :: queue:queue(
-        {async, integer(), command(), args()} | {sync, gen_server:from(), command(), args()}
-    )
+    %% every outstanding request, queued or in flight: id => {Deliver, Func}.
+    %% Deliver is {reply, From} for `sync_command/3` callers and
+    %% {callback, Callback} for the `datalayers:async_*` callers.
+    pending = #{} :: #{integer() => {deliver(), command()}},
+    %% requests waiting to be dispatched
+    queue = queue:new() :: queue:queue({integer(), command(), args()})
 }).
 
--define(client_ref(Ref), #state{client = Ref}).
-
--define(connect, connect).
--define(is_ok, {ok, _}).
--define(is_err, {error, _}).
+-type deliver() :: {reply, gen_server:from()} | {callback, callback()}.
 
 -export([
     start/0,
@@ -53,6 +48,8 @@ stop(Client) when is_pid(Client) ->
 
 -spec sync_command(client(), command(), args()) -> any().
 sync_command(Client, Command, Args) ->
+    %% The NIF bounds every flight stage with a timeout and always replies, even on
+    %% failure, so the caller needs no deadline of its own here.
     gen_server:call(Client, ?REQ(Command, Args), infinity).
 
 %% ================================================================================
@@ -63,130 +60,148 @@ start_link() ->
 init([]) ->
     {ok, #state{client = undefined, opts = undefined}}.
 
+%% `current = undefined` means nothing is queued or in flight, so this socket
+%% has never been asked to connect before. Without it a second `connect` issued
+%% while the first is still in flight would be accepted (the `client` field is
+%% only filled in by `deliver/4` once the result arrives), and the second
+%% connection would silently replace the first one's channel.
 handle_call(
-    ?REQ(?connect, Args = [Opts]),
-    _From,
-    State
+    ?REQ(connect, [Opts]),
+    From,
+    State = #state{client = undefined, current = undefined}
 ) ->
-    case apply_nif(?connect, Args) of
-        {ok, ClientRef} = Ok when is_reference(ClientRef) ->
-            {reply, Ok, State#state{client = ClientRef, opts = Opts}};
-        ?is_err = Err ->
-            {reply, Err, State}
-    end;
-handle_call(_, _From, State = ?client_ref(ClientRef)) when
+    {noreply, enqueue(connect, [Opts], {reply, From}, State#state{opts = Opts})};
+handle_call(?REQ(connect, _Args), _From, State) ->
+    %% Already connected, or a connect request is still queued or in flight.
+    {reply, {error, already_connected}, State};
+handle_call(?REQ(_Func, _Args), _From, State = #state{client = ClientRef}) when
     not is_reference(ClientRef)
 ->
     {reply, {error, not_connected}, State};
-handle_call(?REQ(Func, Args), From, State = ?client_ref(ClientRef)) when
+handle_call(?REQ(Func, Args), From, State) ->
+    %% A synchronous request shares the queue with the asynchronous ones, so it must
+    %% not overtake the requests already queued or in flight. It is submitted to the
+    %% NIF and answered from `handle_info/2` once it completes; the socket process
+    %% stays responsive the whole time.
+    {noreply, enqueue(Func, Args, {reply, From}, State)}.
+
+%% handle_info(?ASYNC_REQ{...}) -- enqueue and dispatch at most one at a time.
+handle_info(?ASYNC_REQ(Func, Args, Callback), State = #state{client = ClientRef}) when
     is_reference(ClientRef)
 ->
-    %% One socket serves both synchronous and asynchronous requests, so a sync
-    %% request is queued as well: it must not overtake the requests that are already
-    %% queued or in flight on this connection.
-    Queue = queue:in({sync, From, Func, Args}, State#state.queue),
-    {noreply, maybe_dispatch(State#state{queue = Queue})}.
-
-%% handle_info({async, ...}) -- enqueue and dispatch at most one at a time.
-handle_info(?ASYNC_REQ(Func, Args, Callback), State) ->
-    case State#state.client of
-        ClientRef when is_reference(ClientRef) ->
-            %% The correlation id is an integer rather than a make_ref(): it is passed
-            %% into the Rust NIF and re-encoded into the completion message from a
-            %% different environment (the worker's OwnedEnv).  An integer decodes and
-            %% encodes as i64 directly, while a Reference is bound to its environment
-            %% and would need an extra OwnedEnv::save/load copy.  `unique_integer/1` is
-            %% monotonically unique per node and never reused, so it is just as safe as
-            %% a reference as a correlation key.
-            Id = erlang:unique_integer([monotonic, positive]),
-            Pending = maps:put(Id, Callback, State#state.pending),
-            Queue = queue:in({async, Id, Func, Args}, State#state.queue),
-            {noreply, maybe_dispatch(State#state{pending = Pending, queue = Queue})};
-        _ ->
-            reply_callback(Callback, {error, not_connected}),
-            {noreply, State}
-    end;
-%% completion message sent by the NIF worker thread
-handle_info({datalayers_async_result, Id, Res}, State) ->
-    case State#state.current of
-        Id ->
-            case maps:take(Id, State#state.pending) of
-                {Callback, Pending} ->
-                    reply_callback(Callback, Res),
-                    {noreply, maybe_dispatch(State#state{current = undefined, pending = Pending})};
-                error ->
-                    {noreply, State}
-            end;
-        _ ->
-            %% stale result (e.g. after stop/restart); ignore
-            {noreply, State}
-    end;
+    {noreply, enqueue(Func, Args, {callback, Callback}, State)};
+handle_info(?ASYNC_REQ(_Func, _Args, Callback), State) ->
+    reply_callback(Callback, {error, not_connected}),
+    {noreply, State};
+%% completion message sent by the NIF task
+handle_info(
+    {datalayers_async_result, Id, Res},
+    State = #state{current = Id, pending = Pending}
+) when
+    is_map_key(Id, Pending)
+->
+    {noreply, maybe_dispatch(complete(Id, Res, State))};
+handle_info({datalayers_async_result, _Id, _Res}, State) ->
+    %% stale completion (e.g. after stop/restart); ignore
+    {noreply, State};
 handle_info(_, State) ->
     %% Ignore other messages
     {noreply, State}.
 
-handle_cast(stop, State = ?client_ref(undefined)) ->
-    %% Client Ref already stopped or never connected, ignore
-    {stop, normal, State};
-handle_cast(stop, State = ?client_ref(ClientRef)) ->
-    _ = datalayers_nif:stop(ClientRef),
-    %% Answer queued synchronous callers before stopping, otherwise they would wait
-    %% forever on `gen_server:call(..., infinity)`.
-    ok = reply_pending_sync(State#state.queue),
-    {stop, normal, State#state{client = undefined, queue = queue:new()}}.
+handle_cast(stop, State = #state{client = ClientRef, pending = Pending}) ->
+    case is_reference(ClientRef) of
+        true ->
+            %% Fire and forget: `stop/1` drops the client (closing its channel) on
+            %% the NIF task, without blocking this process.
+            _ = ?NIF_MODULE:stop(ClientRef);
+        false ->
+            ok
+    end,
+    %% Answer queued and in-flight synchronous callers before stopping, otherwise
+    %% they would wait forever on `gen_server:call(..., infinity)`.
+    ok = reply_pending_sync(Pending),
+    {stop, normal, State#state{
+        client = undefined, current = undefined, pending = #{}, queue = queue:new()
+    }}.
 
 %% ================================================================================
 %% Helpers
 
-maybe_dispatch(State = #state{current = undefined, queue = Queue, client = ClientRef}) when
-    is_reference(ClientRef)
-->
+enqueue(Func, Args, Deliver, State = #state{pending = Pending0, queue = Queue0}) ->
+    %% The correlation id is an integer rather than a make_ref(): it is passed into
+    %% the Rust NIF and re-encoded into the completion message from a different
+    %% environment (the task's OwnedEnv). An integer decodes and encodes as i64
+    %% directly, while a Reference is bound to its environment and would need an
+    %% extra OwnedEnv::save/load copy. `unique_integer/1` is monotonically unique
+    %% per node and never reused, so it is just as safe as a reference.
+    Id = erlang:unique_integer([monotonic, positive]),
+    Pending = maps:put(Id, {Deliver, Func}, Pending0),
+    Queue = queue:in({Id, Func, Args}, Queue0),
+    maybe_dispatch(State#state{pending = Pending, queue = Queue}).
+
+maybe_dispatch(State = #state{current = undefined, queue = Queue}) ->
     case queue:out(Queue) of
-        {{value, {async, Id, Func, Args}}, Queue1} ->
+        {{value, {Id, Func, Args}}, Queue1} ->
             State1 = State#state{queue = Queue1, current = Id},
-            case apply_async_nif(Func, [ClientRef | Args], Id) of
+            case apply_async_nif(Func, Args, State1#state.client, self(), Id) of
                 ok ->
                     State1;
                 {error, Reason} ->
-                    %% Submission failed; complete it now so the caller is not stuck.
-                    {Callback, Pending} = maps:take(Id, State1#state.pending),
-                    reply_callback(Callback, {error, Reason}),
-                    maybe_dispatch(State1#state{current = undefined, pending = Pending})
+                    %% Submission rejected (e.g. a stale resource reference); finish
+                    %% the request now so the caller is not left waiting.
+                    maybe_dispatch(complete(Id, {error, Reason}, State1))
             end;
-        {{value, {sync, From, Func, Args}}, Queue1} ->
-            %% Runs in this process; the shared queue is what keeps it ordered with
-            %% the asynchronous requests on the same connection.
-            Result = apply_nif(Func, [ClientRef | Args]),
-            _ = gen_server:reply(From, Result),
-            maybe_dispatch(State#state{queue = Queue1});
         {empty, _} ->
             State
     end;
 maybe_dispatch(State) ->
     State.
 
-reply_pending_sync(Queue) ->
-    case queue:out(Queue) of
-        {{value, {sync, From, _Func, _Args}}, Queue1} ->
-            _ = gen_server:reply(From, {error, stopped}),
-            reply_pending_sync(Queue1);
-        {{value, {async, _Id, _Func, _Args}}, Queue1} ->
-            %% Async callers are released by the socket monitor on the caller side.
-            reply_pending_sync(Queue1);
-        {empty, _} ->
-            ok
-    end.
+%% Finish one request: run its Deliver function and free the in-flight slot.
+complete(Id, Res, State = #state{pending = Pending0}) ->
+    {Deliver, Func} = maps:get(Id, Pending0),
+    Pending = maps:remove(Id, Pending0),
+    deliver(Func, Deliver, Res, State#state{current = undefined, pending = Pending}).
 
-apply_async_nif(execute, [ClientRef, Sql], Id) ->
-    ?NIF_MODULE:async_execute(ClientRef, self(), Id, Sql);
-apply_async_nif(prepare, [ClientRef, Sql, AutoRebuild], Id) ->
-    ?NIF_MODULE:async_prepare(ClientRef, self(), Id, Sql, AutoRebuild);
-apply_async_nif(execute_prepare, [ClientRef, Statement, Params], Id) ->
-    ?NIF_MODULE:async_execute_prepare(ClientRef, self(), Id, Statement, Params).
+deliver(connect, {reply, From}, {ok, ClientRef} = Res, State) when is_reference(ClientRef) ->
+    _ = gen_server:reply(From, Res),
+    State#state{client = ClientRef};
+deliver(_Func, {reply, From}, Res, State) ->
+    _ = gen_server:reply(From, Res),
+    State;
+deliver(_Func, {callback, Callback}, Res, State) ->
+    reply_callback(Callback, Res),
+    State.
+
+reply_pending_sync(Pending) ->
+    maps:foreach(
+        fun(_Id, {Deliver, _Func}) ->
+            case Deliver of
+                {reply, From} ->
+                    _ = gen_server:reply(From, {error, stopped});
+                {callback, _Callback} ->
+                    %% Asynchronous callers are released by the socket monitor held
+                    %% on the caller side (emqx_resource_buffer_worker).
+                    ok
+            end
+        end,
+        Pending
+    ),
+    ok.
+
+apply_async_nif(connect, [Opts], _ClientRef, ReplyPid, Id) ->
+    ?NIF_MODULE:async_connect(ReplyPid, Id, Opts);
+apply_async_nif(use_database, [Database], ClientRef, ReplyPid, Id) ->
+    ?NIF_MODULE:async_use_database(ReplyPid, Id, ClientRef, Database);
+apply_async_nif(execute, [Sql], ClientRef, ReplyPid, Id) ->
+    ?NIF_MODULE:async_execute(ReplyPid, Id, ClientRef, Sql);
+apply_async_nif(prepare, [Sql, AutoRebuild], ClientRef, ReplyPid, Id) ->
+    ?NIF_MODULE:async_prepare(ReplyPid, Id, ClientRef, Sql, AutoRebuild);
+apply_async_nif(execute_prepare, [Statement, Params], ClientRef, ReplyPid, Id) ->
+    ?NIF_MODULE:async_execute_prepare(ReplyPid, Id, ClientRef, Statement, Params);
+apply_async_nif(close_prepared, [Statement], ClientRef, ReplyPid, Id) ->
+    ?NIF_MODULE:async_close_prepared(ReplyPid, Id, ClientRef, Statement).
 
 reply_callback({CallbackFun, CallbackArgs}, Res) ->
     _ = erlang:apply(CallbackFun, CallbackArgs ++ [Res]),
     ok.
-
-apply_nif(Func, Args) ->
-    erlang:apply(?NIF_MODULE, Func, Args).

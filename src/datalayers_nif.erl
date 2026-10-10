@@ -1,20 +1,14 @@
 -module(datalayers_nif).
 
 -export([
-    connect/1,
-    use_database/2,
-
-    execute/2,
-
-    prepare/3,
-    execute_prepare/3,
-    close_prepared/2,
-
-    stop/1,
-
+    async_connect/3,
+    async_use_database/4,
     async_execute/4,
     async_prepare/5,
-    async_execute_prepare/5
+    async_execute_prepare/5,
+    async_close_prepared/4,
+
+    stop/1
 ]).
 
 -export([init/0]).
@@ -32,35 +26,33 @@ init() ->
 
 %% =================================================================================================
 %% NIFs
+%%
+%% Every operation is asynchronous: the call returns `ok` as soon as the work has
+%% been submitted, or `{error, Reason}` when the arguments could not be accepted
+%% (e.g. a stale resource reference). The result is delivered to `ReplyPid` as
+%% `{datalayers_async_result, Id, Result}`, where `Result` is `{ok, Value}` or
+%% `{error, Reason}`. The NIF never blocks the calling process, so a stalled
+%% server can not pin a BEAM scheduler thread.
 
-connect(_Opts) ->
+async_connect(_ReplyPid, _Id, _Opts) ->
     not_loaded(?LINE).
 
-use_database(_Client, _DbName) ->
+async_use_database(_ReplyPid, _Id, _Client, _Database) ->
     not_loaded(?LINE).
 
-execute(_Client, _Sql) ->
+async_execute(_ReplyPid, _Id, _Client, _Sql) ->
     not_loaded(?LINE).
 
-prepare(_Client, _Sql, _AutoRebuild) ->
+async_prepare(_ReplyPid, _Id, _Client, _Sql, _AutoRebuild) ->
     not_loaded(?LINE).
 
-execute_prepare(_Client, _Statement, _Params) ->
+async_execute_prepare(_ReplyPid, _Id, _Client, _Statement, _Params) ->
     not_loaded(?LINE).
 
-close_prepared(_Client, _Statement) ->
+async_close_prepared(_ReplyPid, _Id, _Client, _Statement) ->
     not_loaded(?LINE).
 
 stop(_Client) ->
-    not_loaded(?LINE).
-
-async_execute(_Client, _ReplyPid, _Id, _Sql) ->
-    not_loaded(?LINE).
-
-async_prepare(_Client, _ReplyPid, _Id, _Sql, _AutoRebuild) ->
-    not_loaded(?LINE).
-
-async_execute_prepare(_Client, _ReplyPid, _Id, _Statement, _Params) ->
     not_loaded(?LINE).
 
 %% =================================================================================================
